@@ -107,6 +107,7 @@ where
 /// When accumulation is going to end, the decider will perform the check if the
 /// final accumulator is valid or not, where the check is usually much more
 /// expensive than accumulation verification.
+/// ? Looks like this is only implemented for Native/EVM types
 pub trait AccumulationDecider<C, L>: AccumulationScheme<C, L>
 where
     C: CurveAffine,

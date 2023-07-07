@@ -421,7 +421,7 @@ pub struct EcPoint<C: CurveAffine, EccChip: EccInstructions<C>> {
 }
 
 impl<C: CurveAffine, EccChip: EccInstructions<C>> EcPoint<C, EccChip> {
-    /// Into [`EccInstructions::AssignedEcPoint`].
+    /// Into [`EccInstructions::AssignedEcPoint`]. (Unwraps `self`'s inner `Value` as either constant or variable)
     pub fn into_assigned(self) -> EccChip::AssignedEcPoint {
         match self.value.into_inner() {
             Value::Constant(constant) => self.loader.assign_const_ec_point(constant),

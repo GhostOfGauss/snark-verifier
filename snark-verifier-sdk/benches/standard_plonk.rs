@@ -1,17 +1,16 @@
+use ark_std::{end_timer, start_timer};
 use criterion::{criterion_group, criterion_main};
 use criterion::{BenchmarkId, Criterion};
 use halo2_base::gates::builder::CircuitBuilderStage;
-use halo2_base::utils::fs::gen_srs;
-use pprof::criterion::{Output, PProfProfiler};
-use rand::rngs::OsRng;
-use std::path::Path;
-use ark_std::{end_timer, start_timer};
 use halo2_base::halo2_proofs;
+use halo2_base::utils::fs::gen_srs;
 use halo2_proofs::halo2curves as halo2_curves;
 use halo2_proofs::{
     halo2curves::bn256::Bn256,
     poly::{commitment::Params, kzg::commitment::ParamsKZG},
 };
+use pprof::criterion::{Output, PProfProfiler};
+use rand::rngs::OsRng;
 use snark_verifier_sdk::evm::{evm_verify, gen_evm_proof_shplonk, gen_evm_verifier_shplonk};
 use snark_verifier_sdk::halo2::aggregation::AggregationConfigParams;
 use snark_verifier_sdk::{
@@ -20,6 +19,7 @@ use snark_verifier_sdk::{
     Snark,
 };
 use snark_verifier_sdk::{CircuitExt, SHPLONK};
+use std::path::Path;
 
 mod application {
     use super::halo2_curves::bn256::Fr;
@@ -108,6 +108,13 @@ mod application {
             StandardPlonkConfig::configure(meta)
         }
 
+        /// q_a * a + q_b * b + q_c * c + q_ab * a * b + q_const + instance[i] = 0
+        ///
+        ///  -1 * self.0 + ...                                 0 + instance[0]
+        ///   1 * -5 + 2  * 0 +   3 * 0 +   4  * 0 * 0 +    5    + instance[1]
+        ///   0 *  1 + 0 * 0 + ....
+        ///   (b[3] = a[2])
+        ///   (c[4] = a[2])
         fn synthesize(
             &self,
             config: Self::Config,
@@ -118,8 +125,10 @@ mod application {
                 |mut region| {
                     #[cfg(feature = "halo2-pse")]
                     {
+                        // -1 * self.0  + self.instances = 0
                         region.assign_advice(|| "", config.a, 0, || Value::known(self.0))?;
                         region.assign_fixed(|| "", config.q_a, 0, || Value::known(-Fr::one()))?;
+                        // 1 * -5 + 2 * 0 + 3 * 0 + 4 * (-5) * 0 + 5 = 0
                         region.assign_advice(
                             || "",
                             config.a,
@@ -140,16 +149,24 @@ mod application {
                                 || Value::known(Fr::from(idx as u64)),
                             )?;
                         }
+                        // 0 * 1 = 0
                         let a =
                             region.assign_advice(|| "", config.a, 2, || Value::known(Fr::one()))?;
+                        // 1 = a[2] = b[3]
                         a.copy_advice(|| "", &mut region, config.b, 3)?;
+                        // 1 = a[2] = c[4]
                         a.copy_advice(|| "", &mut region, config.c, 4)?;
+                        dbg!(region);
                     }
                     #[cfg(feature = "halo2-axiom")]
                     {
+                        // in row 0, advice `a` holds `self.0`
                         region.assign_advice(config.a, 0, Value::known(self.0));
+                        // in row 0, selector `q_a` holds `-1`
                         region.assign_fixed(config.q_a, 0, -Fr::one());
+                        // in row 1, advice `a` holds -5
                         region.assign_advice(config.a, 1, Value::known(-Fr::from(5u64)));
+                        // in row 1, `q_a = 1, q_b = 2, q_c = 3, q_ab = 4, q_const = 5`
                         for (idx, column) in (1..).zip([
                             config.q_a,
                             config.q_b,
@@ -159,10 +176,12 @@ mod application {
                         ]) {
                             region.assign_fixed(column, 1, Fr::from(idx as u64));
                         }
-
+                        // in row 2, advice `a` holds 1
                         let a = region.assign_advice(config.a, 2, Value::known(Fr::one()));
+                        // a[2] = b[3], a[2] = c[4]
                         a.copy_advice(&mut region, config.b, 3);
                         a.copy_advice(&mut region, config.c, 4);
+                        dbg!(region);
                     }
 
                     Ok(())
@@ -179,9 +198,38 @@ fn gen_application_snark(params: &ParamsKZG<Bn256>) -> Snark {
     gen_snark_shplonk(params, &pk, circuit, Some(Path::new("app.snark")))
 }
 
+/// Same as benchmark below but without the Criterion framework.
+#[test]
+fn aggregation_circuit() {
+    let path = "./configs/example_evm_accumulator.json";
+    let params_app = gen_srs(3);
+
+    let snarks = [(); 3].map(|_| gen_application_snark(&params_app));
+    let agg_config = AggregationConfigParams::from_path(path);
+    let params = gen_srs(agg_config.degree);
+    let lookup_bits = params.k() as usize - 1;
+
+    let agg_circuit = AggregationCircuit::keygen::<SHPLONK>(&params, snarks.clone());
+
+    let start0 = start_timer!(|| "gen vk & pk");
+    let pk = gen_pk(&params, &agg_circuit, Some(Path::new("agg.pk")));
+    end_timer!(start0);
+    let break_points = agg_circuit.break_points();
+
+    let agg_circuit = AggregationCircuit::new::<SHPLONK>(
+        CircuitBuilderStage::Prover,
+        Some(break_points.clone()),
+        lookup_bits,
+        &params,
+        snarks.clone(),
+    );
+    let instances = agg_circuit.instances();
+    let proof = gen_proof_shplonk(&params, &pk, agg_circuit, instances, None);
+}
+
 fn bench(c: &mut Criterion) {
     let path = "./configs/example_evm_accumulator.json";
-    let params_app = gen_srs(8);
+    let params_app = gen_srs(3);
 
     let snarks = [(); 3].map(|_| gen_application_snark(&params_app));
     let agg_config = AggregationConfigParams::from_path(path);

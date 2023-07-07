@@ -100,7 +100,7 @@ where
     let mut accumulators = snarks
         .iter()
         .flat_map(|snark| {
-            let protocol = snark.protocol.loaded(loader);
+            let protocol = snark.protocol.loaded(loader); // Is this a sign of heterogeneous aggregation?
             let instances = assign_instances(&snark.instances);
 
             // read the transcript and perform Fiat-Shamir
@@ -113,6 +113,7 @@ where
                 &mut transcript,
             )
             .unwrap();
+            // This is computing the `lhs, rhs` G1 points in circuit
             let accumulator =
                 PlonkSuccinctVerifier::<AS>::verify(svk, &protocol, &instances, &proof).unwrap();
 
@@ -132,6 +133,7 @@ where
             &mut transcript,
         )
         .unwrap();
+        // Doesn't this call to `verify` just do the entire RLC in circuit? Why bother to do it natively first?
         <AS as AccumulationScheme<_, _>>::verify(&Default::default(), &accumulators, &proof)
             .unwrap()
     } else {
@@ -194,7 +196,8 @@ pub trait Halo2KzgAccumulationScheme<'a> = PolynomialCommitmentScheme<
 
 impl AggregationCircuit {
     /// Given snarks, this creates a circuit and runs the `GateThreadBuilder` to verify all the snarks.
-    /// By default, the returned circuit has public instances equal to the limbs of the pair of elliptic curve points, referred to as the `accumulator`, that need to be verified in a final pairing check.
+    /// By default, the returned circuit has public instances equal to the limbs of the pair of elliptic curve points,
+    /// referred to as the `accumulator`, that need to be verified in a final pairing check.
     ///
     /// The user can optionally modify the circuit after calling this function to add more instances to `assigned_instances` to expose.
     ///
@@ -227,11 +230,14 @@ impl AggregationCircuit {
                     &mut transcript_read,
                 )
                 .unwrap();
+                // ? Is this steps 1 - 11 of GWC19 ?
+                // This is returning the `lhs, rhs` G1 points that Step 12
                 PlonkSuccinctVerifier::<AS>::verify(&svk, &snark.protocol, &snark.instances, &proof)
                     .unwrap()
             })
             .collect_vec();
 
+        // The accumulated RLC of `lhs,rhs` and a proof that this was done correctly
         let (_accumulator, as_proof) = {
             let mut transcript_write = PoseidonTranscript::<NativeLoader, Vec<u8>>::from_spec(
                 vec![],
@@ -240,7 +246,7 @@ impl AggregationCircuit {
             let rng = StdRng::from_entropy();
             let accumulator =
                 AS::create_proof(&Default::default(), &accumulators, &mut transcript_write, rng)
-                    .unwrap();
+                    .unwrap(); // Form RLC of `lhs, rhs`
             (accumulator, transcript_write.finalize())
         };
 
@@ -256,6 +262,7 @@ impl AggregationCircuit {
         let ecc_chip = BaseFieldEccChip::new(&fp_chip);
         let loader = Halo2Loader::new(ecc_chip, builder);
 
+        // Now accumulator is the RLC of lhs, rhs and has been computed in circuit
         let (previous_instances, accumulator) =
             aggregate::<AS>(&svk, &loader, &snarks, as_proof.as_slice());
         let lhs = accumulator.lhs.assigned();

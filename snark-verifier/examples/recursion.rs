@@ -284,6 +284,10 @@ mod application {
             let i = meta.instance_column();
             meta.create_gate("square", |meta| {
                 let q = meta.query_selector(q);
+                //  q   i
+                //  1   a
+                //  1   a*a
+                //  1   a*a*a*a ...
                 let [i, i_w] = [0, 1].map(|rotation| meta.query_instance(i, Rotation(rotation)));
                 Some(q * (i.clone() * i - i_w))
             });
@@ -350,6 +354,7 @@ mod recursion {
         fn state_transition(&self, input: Self::Input) -> Fr;
     }
 
+    /// verify `snark` in the circuit held by `loader`
     fn succinct_verify<'a>(
         svk: &Svk,
         loader: &Rc<Halo2Loader<'a>>,
@@ -472,6 +477,15 @@ mod recursion {
         const STATE_ROW: usize = 4 * LIMBS + 2;
         const ROUND_ROW: usize = 4 * LIMBS + 3;
 
+        /// Natively:
+        /// - Use `PlonkSuccinctVerifier` to get the KZG acc. `(lhs, rhs)` for `app`
+        /// - Repeat to get the KZG acc. for `previous` (if `round > 0`)
+        /// - Combine KZG accumulators with `As::create_proof`
+        ///
+        /// At this point you have an `accumulator` and `as_proof` (Accumulation Scheme proof)
+        /// that it is well-formed. None of that was done in circuit.
+        ///
+        /// Next, verify that proof in-circuit using `RecursionCircuit::build`
         pub fn new(
             params: &ParamsKZG<Bn256>,
             app: Snark,
@@ -481,8 +495,11 @@ mod recursion {
             round: usize,
         ) -> Self {
             let svk = params.get_g()[0].into();
+            // g[0] = generator, g[1] = tau * generator
             let default_accumulator = KzgAccumulator::new(params.get_g()[1], params.get_g()[0]);
 
+            // lambda that reads the proof from a transcript and checks it using `svk`
+            // NOTE: Returns accumulators, meaning `(lhs, rhs)` pairs for KZG check
             let succinct_verify = |snark: &Snark| {
                 let mut transcript = PoseidonTranscript::<NativeLoader, _>::new::<SECURE_MDS>(
                     snark.proof.as_slice(),
@@ -515,6 +532,7 @@ mod recursion {
                 (accumulator, transcript.finalize())
             };
 
+            // Digest of the previous protocol's `preprocessed` and its `transcript_initial_state`
             let preprocessed_digest = {
                 let inputs = previous
                     .protocol
@@ -526,6 +544,9 @@ mod recursion {
                     .collect_vec();
                 poseidon(&NativeLoader, &inputs)
             };
+            // Index of `preprocessed_digest` is 12
+            // This makes sense because `accumulator` is two G1 points, i.e. 4 Fq points,
+            // and we use 3 Fr-limbs to represent an Fq point
             let instances =
                 [accumulator.lhs.x, accumulator.lhs.y, accumulator.rhs.x, accumulator.rhs.y]
                     .into_iter()
@@ -550,6 +571,17 @@ mod recursion {
             circuit
         }
 
+        /// In circuit:
+        /// - Load instance data
+        /// - Check `self.app` proof, yielding KZG acc.
+        /// - Check `self.previous` proof, yielding KZG acc.
+        /// - Combine accumulators
+        /// - Consistency constraints:
+        ///     - Propagate preprocessed digest
+        ///     - Propagate initial state
+        ///     - Check current state
+        ///
+        /// Note we do not do the pairing check in circuit
         fn build(&mut self) {
             let lookup_bits = var("LOOKUP_BITS").unwrap().parse().unwrap();
             let range = RangeChip::<Fr>::default(lookup_bits);
@@ -629,7 +661,8 @@ mod recursion {
             ] {
                 ctx.constrain_equal(lhs, rhs);
             }
-            *self.inner.0.builder.borrow_mut() = builder;
+            *self.inner.0.builder.borrow_mut() = builder.clone();
+            dbg!(builder.config(GLOBAL_K, Some(10)));
 
             self.assigned_instances.extend(
                 [lhs.x(), lhs.y(), rhs.x(), rhs.y()]
@@ -638,6 +671,8 @@ mod recursion {
                     .chain([preprocessed_digest, initial_state, state, round].iter())
                     .copied(),
             );
+            // Why 10 min rows?
+            // let config = builder.config(GLOBAL_K, Some(10));
         }
 
         fn initial_snark(params: &ParamsKZG<Bn256>, vk: Option<&VerifyingKey<G1Affine>>) -> Snark {
@@ -753,6 +788,8 @@ mod recursion {
         }
     }
 
+    /// `gen_pk` except that it first constructs a `RecursionCircuit` and generates
+    /// this circuit's proving key.
     pub fn gen_recursion_pk<ConcreteCircuit: CircuitExt<Fr>>(
         recursion_params: &ParamsKZG<Bn256>,
         app_params: &ParamsKZG<Bn256>,
@@ -768,7 +805,7 @@ mod recursion {
         );
         // we cannot auto-configure the circuit because dummy_snark must know the configuration beforehand
         // uncomment the following line only in development to test and print out the optimal configuration ahead of time
-        // recursion.inner.0.builder.borrow().config(recursion_params.k() as usize, Some(10));
+        // recursion.inner.0.builder.borrow().config(recursion_params.k as usize, Some(10));
         gen_pk(recursion_params, &recursion)
     }
 
@@ -804,11 +841,16 @@ mod recursion {
     }
 }
 
+/// k for the recursion circuit, taken from config file
+const GLOBAL_K: usize = 21;
+
+// cargo run --package snark-verifier --example recursion --features halo2-axiom,loader_halo2,display
 fn main() {
     let app_params = gen_srs(3);
     let recursion_config: AggregationConfigParams =
         serde_json::from_reader(fs::File::open("configs/example_recursion.json").unwrap()).unwrap();
-    let k = recursion_config.degree;
+    // let k = recursion_config.degree;
+    let k = GLOBAL_K as u32;
     let recursion_params = gen_srs(k);
     let flex_gate_config = FlexGateConfigParams {
         strategy: GateStrategy::Vertical,
@@ -831,6 +873,7 @@ fn main() {
     end_timer!(pk_time);
 
     let num_round = 1;
+    print!("Performing {num_round} rounds of recursion");
     let pf_time = start_timer!(|| "Generate full recursive snark");
     let (final_state, snark) = recursion::gen_recursion_snark::<application::Square>(
         &app_params,

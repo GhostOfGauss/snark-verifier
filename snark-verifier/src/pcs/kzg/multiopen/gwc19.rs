@@ -65,7 +65,7 @@ where
             .ws
             .iter()
             .zip(powers_of_u.iter())
-            .map(|(w, power_of_u)| Msm::base(w) * power_of_u)
+            .map(|(w, power_of_u)| Msm::base(w ) * power_of_u)
             .collect_vec();
         let lhs = f + rhs
             .iter()

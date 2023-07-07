@@ -55,6 +55,7 @@ where
         PlonkProof::read::<T, AE>(svk, protocol, instances, transcript)
     }
 
+    /// Called during circuit building for recursive verifier
     fn verify(
         svk: &Self::VerifyingKey,
         protocol: &Self::Protocol,
