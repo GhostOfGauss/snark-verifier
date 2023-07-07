@@ -318,7 +318,7 @@ mod aggregation {
     #[derive(Clone, Debug)]
     pub struct AggregationCircuit {
         pub circuit: RangeCircuitBuilder<Fr>,
-        pub as_proof: Vec<u8>,
+        pub as_proof: Vec<u8>, // it is a finalized transcript of RLC
         pub assigned_instances: Vec<AssignedValue<Fr>>,
     }
 
@@ -333,13 +333,22 @@ mod aggregation {
             let svk: Svk = params_g0.into();
             let snarks = snarks.into_iter().collect_vec();
 
-            // verify the snarks natively to get public instances
+            // natively generate the input of batched pairing check, similar to 
+            // $\Phi-prepare$ in our notion
             let accumulators = snarks
                 .iter()
                 .flat_map(|snark| {
+                    // Initialize the transcript from the prover's message
                     let mut transcript = PoseidonTranscript::<NativeLoader, _>::new::<SECURE_MDS>(
                         snark.proof.as_slice(),
                     );
+                    // Compute challenges, return proofs with challenges 
+                    // proof contains: 
+                    // - polynomial commitments of advice and instance columns, 
+                    // - challenges 
+                    // - opennings
+                    //   - evaluations 
+                    //   - KZG proofs
                     let proof = PlonkSuccinctVerifier::read_proof(
                         &svk,
                         &snark.protocol,
@@ -347,12 +356,17 @@ mod aggregation {
                         &mut transcript,
                     )
                     .unwrap();
+                    // returns two $\GG_1$ points, used in batched pairing check
                     PlonkSuccinctVerifier::verify(&svk, &snark.protocol, &snark.instances, &proof)
                         .unwrap()
                 })
                 .collect_vec();
 
+            // compute:
+            // - _accumulator: two $\GG_1$ point after RLC
+            // - as_proof: seralized_transcript
             let (_accumulator, as_proof) = {
+                // transcript for the outter circuit
                 let mut transcript =
                     PoseidonTranscript::<NativeLoader, _>::new::<SECURE_MDS>(Vec::new());
                 let accumulator =
@@ -373,10 +387,12 @@ mod aggregation {
             let ecc_chip = BaseFieldEccChip::new(&fp_chip);
             let loader = Halo2Loader::new(ecc_chip, builder);
 
+            // do $\Phi-Prepare$ in circuit 
             let KzgAccumulator { lhs, rhs } =
                 aggregate(&svk, &loader, &snarks, as_proof.as_slice());
             let lhs = lhs.assigned();
             let rhs = rhs.assigned();
+            // assigned_instances: lhs.x :: lhs.y :: rhs.x :: rhs.y
             let assigned_instances = lhs
                 .x()
                 .limbs()
@@ -649,6 +665,7 @@ fn main() {
         File::open(path).unwrap_or_else(|e| panic!("{path} does not exist: {e:?}")),
     )
     .unwrap();
+    // $$\Phi-prepare$$
     let agg_circuit = AggregationCircuit::new(
         CircuitBuilderStage::Mock,
         None,
